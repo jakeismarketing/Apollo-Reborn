@@ -1,5 +1,7 @@
 #import "ApolloDuoFeedRail.h"
 #import "ApolloDuoFeedRailToggle.h"
+#import "ApolloDuoFeedRailMultiStore.h"
+#import "ApolloDuoFeedRailMultis.h"
 #import "ApolloFeedShortcutsAppearance.h"
 #import "ApolloGalleryImageLoader.h"
 #import "ApolloNativeSubredditIcons.h"
@@ -36,6 +38,20 @@ static const NSInteger kRailFavoriteTag = -2;
 // at the bottom of the panel, below the favorites.
 static const CGFloat kRailToggleSize = 32;
 static const CGFloat kRailToggleSlot = 48;
+static const NSInteger kRailMultiTag = -3;
+
+// A multireddit's custom icon (ApolloMultiredditEdit.xm), by path.
+extern UIImage *ApolloMultiEditCustomIconForPath(NSString *path);
+
+// Reddit's model path and the feed's own path can differ in case and in a
+// trailing slash; both name the same multireddit.
+BOOL ApolloDuoFeedRailSameMultiredditPath(NSString *a, NSString *b) {
+    if (!a.length || !b.length) return NO;
+    NSCharacterSet *slash = [NSCharacterSet characterSetWithCharactersInString:@"/"];
+    NSString *left = [a stringByTrimmingCharactersInSet:slash];
+    NSString *right = [b stringByTrimmingCharactersInSet:slash];
+    return [left caseInsensitiveCompare:right] == NSOrderedSame;
+}
 
 // The highlight is the shade UIKit's lens gives the tab rail's selected tab,
 // darker than the glass (sampled from the rail on iOS 26 and 27), with the
@@ -81,6 +97,9 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
 @property(nonatomic, strong) UILabel *initial;
 @property(nonatomic, strong) UILabel *label;
 @property(nonatomic, copy) NSString *subreddit;
+// A picked multireddit's path; its `subreddit` is then the first member
+// subreddit, whose icon it shows when it has no custom one.
+@property(nonatomic, copy) NSString *multiredditPath;
 @property(nonatomic, strong) ApolloGalleryImageRequest *iconRequest;
 // The subreddit info lookup has been asked for (once, when first in view).
 @property(nonatomic) BOOL infoRequested;
@@ -167,6 +186,22 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
     self.initial.layer.cornerRadius = kRailAvatarSize / 2;
     [self insertSubview:self.initial belowSubview:self.icon];
     [self loadIconFromURL:iconURL];
+    return self;
+}
+// A picked multireddit: its name over its custom icon, or over its first
+// member subreddit's icon once that loads, its first letter until then.
+- (instancetype)initWithMultiredditPath:(NSString *)path title:(NSString *)title iconSubreddit:(NSString *)iconSubreddit {
+    if (!(self = [self initWithSubreddit:title iconURL:nil])) return nil;
+    self.multiredditPath = path;
+    self.subreddit = iconSubreddit;
+    self.accessibilityLabel = [title stringByAppendingString:@", multireddit"];
+    self.initial.text = title.length ? [title substringToIndex:1].uppercaseString : @"m";
+    UIImage *custom = ApolloMultiEditCustomIconForPath(path);
+    if (custom) {
+        self.hasIcon = YES;
+        self.icon.image = custom;
+        self.initial.hidden = YES;
+    }
     return self;
 }
 - (void)loadIconFromURL:(NSURL *)url {
@@ -317,7 +352,7 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
 }
 @end
 
-@interface ApolloDuoFeedRail () <UIScrollViewDelegate>
+@interface ApolloDuoFeedRail () <UIScrollViewDelegate, UIGestureRecognizerDelegate>
 @property(nonatomic, strong) ApolloDuoFeedRailToggleButton *collapseButton;
 @property(nonatomic, strong) UIVisualEffectView *panel;
 @property(nonatomic, strong) NSArray<ApolloDuoFeedRailButton *> *feedButtons;
@@ -330,6 +365,24 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
 @property(nonatomic, copy) NSArray<NSNumber *> *shortcuts;
 @property(nonatomic) NSInteger shortcutStyle;
 @property(nonatomic, copy) NSArray<NSString *> *favoriteNames;
+// The picked multireddits, after the favorites in the same scroll area.
+@property(nonatomic, strong) NSArray<ApolloDuoFeedRailButton *> *multiButtons;
+@property(nonatomic, copy) NSArray<NSDictionary<NSString *, NSString *> *> *multiPicks;
+// The multireddit a held press lifted, while it is dragged.
+@property(nonatomic, weak) ApolloDuoFeedRailButton *draggedButton;
+// Drag to reorder: the multireddits in the order the drag shows, the lifted
+// one's slot and where it started, the finger in the scroll area's content
+// coordinates and its offset from the lifted button's center.
+@property(nonatomic, strong) UILongPressGestureRecognizer *dragPress;
+@property(nonatomic, strong) CADisplayLink *dragScroll;
+@property(nonatomic, copy) NSArray<ApolloDuoFeedRailButton *> *dragOrder;
+@property(nonatomic) NSInteger dragSlot;
+@property(nonatomic) NSInteger dragStartSlot;
+@property(nonatomic) CGFloat dragFingerY;
+@property(nonatomic) CGFloat dragGrabOffset;
+@property(nonatomic, strong) UISelectionFeedbackGenerator *dragFeedback;
+// The picks changed mid-drag; the rail rebuilds once the drag ends.
+@property(nonatomic) BOOL reloadAfterDrag;
 @end
 
 @implementation ApolloDuoFeedRail
@@ -357,6 +410,14 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
     self.favorites.alwaysBounceVertical = NO;
     self.favorites.contentInset = UIEdgeInsetsMake(0, 0, kRailFavoritesBottomInset, 0);
     [self.panel.contentView addSubview:self.favorites];
+    // A held press on a picked multireddit lifts it to drag into a new order.
+    // A quick tap still opens it and a swipe still scrolls: the press only
+    // begins after the hold, and cancels the button's own tap when it does.
+    self.dragPress = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(dragMultireddit:)];
+    self.dragPress.minimumPressDuration = 0.35;
+    self.dragPress.cancelsTouchesInView = YES;
+    self.dragPress.delegate = self;
+    [self.favorites addGestureRecognizer:self.dragPress];
     self.separator = [UIView new];
     self.separator.userInteractionEnabled = NO;
     [self.panel.contentView addSubview:self.separator];
@@ -373,8 +434,15 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
     [self.collapseButton addTarget:self action:@selector(collapseTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.panel.contentView addSubview:self.collapseButton];
     self.accessibilityLabel = @"Feeds";
-    for (NSString *name in @[ApolloFavoriteSubredditsUpdatedNotification, ApolloFeedShortcutsChangedNotification]) {
+    for (NSString *name in @[ApolloFavoriteSubredditsUpdatedNotification, ApolloFeedShortcutsChangedNotification,
+                             ApolloDuoFeedRailMultisChangedNotification]) {
         [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(reloadShortcuts) name:name object:nil];
+    }
+    // Another account's picks show after a switch, even with the Posts feed
+    // left on screen.
+    for (NSString *name in @[@"com.christianselig.RedditCurrentAccountChanged",
+                             @"com.christianselig.RedditAccountChanged"]) {
+        [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(accountChanged) name:name object:nil];
     }
     // Apollo saves a star from the subreddit list (or a confirmed unfavorite)
     // without posting anything, so the column watches the saved list itself.
@@ -400,9 +468,26 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
     dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf reloadShortcuts]; });
 }
 
+// The signed-in username can settle a moment after the switch is announced,
+// so the picks are read again shortly after too.
+- (void)accountChanged {
+    __weak ApolloDuoFeedRail *weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [weakSelf reloadShortcuts];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [weakSelf reloadShortcuts];
+        });
+    });
+}
+
 - (void)reloadShortcuts {
     if (!NSThread.isMainThread) {
         dispatch_async(dispatch_get_main_queue(), ^{ [self reloadShortcuts]; });
+        return;
+    }
+    // Never rebuild the buttons out from under a finger.
+    if (self.draggedButton) {
+        self.reloadAfterDrag = YES;
         return;
     }
     // The feed shortcuts Settings > Feed Shortcuts shows, in its icon style.
@@ -418,7 +503,9 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
     BOOL shortcutsChanged = !self.feedButtons || ![shortcuts isEqualToArray:self.shortcuts ?: @[]]
         || style != self.shortcutStyle;
     BOOL favoritesChanged = !self.favoriteButtons || ![names isEqualToArray:self.favoriteNames ?: @[]];
-    if (!shortcutsChanged && !favoritesChanged) return;
+    NSArray<NSDictionary<NSString *, NSString *> *> *picks = [ApolloDuoFeedRailMultiStore picksForActiveAccount];
+    BOOL multisChanged = !self.multiButtons || ![picks isEqualToArray:self.multiPicks ?: @[]];
+    if (!shortcutsChanged && !favoritesChanged && !multisChanged) return;
     if (shortcutsChanged) {
         self.shortcuts = shortcuts;
         self.shortcutStyle = style;
@@ -463,6 +550,31 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
             [buttons addObject:button];
         }
         self.favoriteButtons = buttons;
+    }
+    if (multisChanged) {
+        if (self.multiPicks) ApolloLog(@"[DuoFeedRail] multireddit picks changed: %lu", (unsigned long)picks.count);
+        self.multiPicks = picks;
+        for (UIView *view in self.multiButtons) [view removeFromSuperview];
+        NSDictionary<NSString *, NSURL *> *icons = picks.count
+            ? ApolloNativeSubredditIconURLs([NSUserDefaults.standardUserDefaults dataForKey:@"SubredditIconData"]) : @{};
+        NSMutableArray<ApolloDuoFeedRailButton *> *buttons = [NSMutableArray array];
+        for (NSDictionary<NSString *, NSString *> *pick in picks) {
+            NSString *path = pick[@"path"];
+            NSString *title = pick[@"title"] ?: path.lastPathComponent;
+            NSString *iconSubreddit = pick[@"icon"];
+            ApolloDuoFeedRailButton *button = [[ApolloDuoFeedRailButton alloc] initWithMultiredditPath:path title:title
+                                                                                          iconSubreddit:iconSubreddit];
+            if (!button.hasIcon && iconSubreddit.length) {
+                [button loadIconFromURL:[ApolloSubredditInfoCache.sharedCache cachedInfoForSubreddit:iconSubreddit].iconURL
+                    ?: icons[iconSubreddit.lowercaseString]];
+            }
+            button.tag = kRailMultiTag;
+            [button addTarget:self action:@selector(tapped:) forControlEvents:UIControlEventTouchUpInside];
+            [self.favorites addSubview:button];
+            [buttons addObject:button];
+        }
+        self.multiButtons = buttons;
+        [self refreshMultiAccessibilityActions];
     }
     [self refreshColors];
     [self setNeedsLayout];
@@ -551,9 +663,19 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
         button.frame = CGRectMake(0, favoriteY, columnWidth, kRailFavoriteHeight);
         favoriteY += kRailFavoriteHeight;
     }
+    // The picked multireddits follow, in their saved order, or the order a
+    // drag shows. The dragged one follows the finger instead.
+    for (ApolloDuoFeedRailButton *button in self.dragOrder ?: self.multiButtons) {
+        if (button != self.draggedButton) {
+            button.frame = CGRectMake(0, favoriteY, columnWidth, kRailFavoriteHeight);
+        } else {
+            button.bounds = CGRectMake(0, 0, columnWidth, kRailFavoriteHeight);
+        }
+        favoriteY += kRailFavoriteHeight;
+    }
     self.favorites.contentSize = CGSizeMake(columnWidth, favoriteY);
     self.favorites.alwaysBounceVertical = favoriteY + kRailFavoritesBottomInset > self.favorites.bounds.size.height;
-    self.separator.hidden = self.favoriteButtons.count == 0;
+    self.separator.hidden = self.favoriteButtons.count + self.multiButtons.count == 0;
     [self requestVisibleIcons];
 }
 
@@ -564,8 +686,10 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
 - (void)requestVisibleIcons {
     if (!self.window || self.hidden || self.alpha < 0.01) return;
     CGRect visible = self.favorites.bounds;
-    for (ApolloDuoFeedRailButton *button in self.favoriteButtons) {
-        if (button.hasIcon || button.infoRequested || !CGRectIntersectsRect(button.frame, visible)) continue;
+    NSArray<ApolloDuoFeedRailButton *> *buttons = [self.favoriteButtons ?: @[] arrayByAddingObjectsFromArray:self.multiButtons ?: @[]];
+    for (ApolloDuoFeedRailButton *button in buttons) {
+        if (button.hasIcon || button.infoRequested || !button.subreddit.length
+            || !CGRectIntersectsRect(button.frame, visible)) continue;
         button.infoRequested = YES;
         __weak ApolloDuoFeedRailButton *weakButton = button;
         NSString *username = ApolloDuoFeedRailUsername(button.subreddit);
@@ -589,6 +713,9 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
 
 - (void)didMoveToWindow {
     [super didMoveToWindow];
+    // Off screen mid-drag (rotation, fold): drop the drag, which also stops
+    // its display link.
+    if (!self.window && self.draggedButton) [self finishDrag:NO];
     [self setNeedsLayout];
 }
 
@@ -607,6 +734,13 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
 - (void)setSelectedSubreddit:(NSString *)selectedSubreddit {
     if (_selectedSubreddit == selectedSubreddit || [_selectedSubreddit isEqualToString:selectedSubreddit]) return;
     _selectedSubreddit = [selectedSubreddit copy];
+    [self refreshColors];
+}
+
+- (void)setSelectedMultiredditPath:(NSString *)selectedMultiredditPath {
+    if (_selectedMultiredditPath == selectedMultiredditPath
+        || [_selectedMultiredditPath isEqualToString:selectedMultiredditPath]) return;
+    _selectedMultiredditPath = [selectedMultiredditPath copy];
     [self refreshColors];
 }
 
@@ -637,6 +771,10 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
         [button applyAccent:accent neutral:neutral];
     }
     [self.collapseButton refreshColors];
+    for (ApolloDuoFeedRailButton *button in self.multiButtons) {
+        button.chosen = ApolloDuoFeedRailSameMultiredditPath(button.multiredditPath, self.selectedMultiredditPath);
+        [button applyAccent:accent neutral:neutral];
+    }
     self.subredditsButton.chosen = self.subredditsSelected;
     [self.subredditsButton applyAccent:accent neutral:neutral];
 }
@@ -660,11 +798,197 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
     if (self.collapse) self.collapse();
 }
 
+#pragma mark - Drag to reorder
+
+// VoiceOver can't drag; it moves a multireddit one place at a time. Rebuilt
+// whenever the order changes (a rebuild or a drop), and each action reads the
+// button's current place when it runs.
+- (void)refreshMultiAccessibilityActions {
+    NSUInteger count = self.multiButtons.count;
+    __weak ApolloDuoFeedRail *weakSelf = self;
+    [self.multiButtons enumerateObjectsUsingBlock:^(ApolloDuoFeedRailButton *button, NSUInteger index, __unused BOOL *stop) {
+        __weak ApolloDuoFeedRailButton *weakButton = button;
+        BOOL (^move)(NSInteger) = ^BOOL(NSInteger step) {
+            ApolloDuoFeedRail *rail = weakSelf;
+            ApolloDuoFeedRailButton *moving = weakButton;
+            NSUInteger current = moving ? [rail.multiButtons indexOfObject:moving] : NSNotFound;
+            if (!rail || current == NSNotFound || !moving.multiredditPath.length) return NO;
+            NSInteger target = (NSInteger)current + step;
+            if (target < 0 || target >= (NSInteger)rail.multiButtons.count) return NO;
+            [ApolloDuoFeedRailMultiStore movePath:moving.multiredditPath toActiveIndex:(NSUInteger)target];
+            return YES;
+        };
+        NSMutableArray<UIAccessibilityCustomAction *> *moves = [NSMutableArray array];
+        if (index > 0) {
+            [moves addObject:[[UIAccessibilityCustomAction alloc] initWithName:@"Move Up"
+                actionHandler:^BOOL(__unused UIAccessibilityCustomAction *action) { return move(-1); }]];
+        }
+        if (index + 1 < count) {
+            [moves addObject:[[UIAccessibilityCustomAction alloc] initWithName:@"Move Down"
+                actionHandler:^BOOL(__unused UIAccessibilityCustomAction *action) { return move(1); }]];
+        }
+        button.accessibilityCustomActions = moves;
+    }];
+}
+
+// The picked multireddit under a point in the scroll area's content, or nil.
+- (ApolloDuoFeedRailButton *)multiButtonAtPoint:(CGPoint)point {
+    for (ApolloDuoFeedRailButton *button in self.multiButtons) {
+        if (CGRectContainsPoint(button.frame, point)) return button;
+    }
+    return nil;
+}
+
+- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)recognizer {
+    if (recognizer != self.dragPress) return YES;
+    return self.multiButtons.count >= 2 && [self multiButtonAtPoint:[recognizer locationInView:self.favorites]];
+}
+
+// The first multireddit's top in the scroll area's content: they follow the
+// favorites.
+- (CGFloat)multiTop {
+    return self.favoriteButtons.count * kRailFavoriteHeight;
+}
+
+- (void)dragMultireddit:(UILongPressGestureRecognizer *)press {
+    switch (press.state) {
+        case UIGestureRecognizerStateBegan: [self beginDragAt:[press locationInView:self.favorites]]; break;
+        case UIGestureRecognizerStateChanged:
+            self.dragFingerY = [press locationInView:self.favorites].y;
+            [self updateDrag];
+            break;
+        case UIGestureRecognizerStateEnded: [self finishDrag:YES]; break;
+        case UIGestureRecognizerStateCancelled:
+        case UIGestureRecognizerStateFailed: [self finishDrag:NO]; break;
+        default: break;
+    }
+}
+
+- (void)beginDragAt:(CGPoint)point {
+    ApolloDuoFeedRailButton *button = [self multiButtonAtPoint:point];
+    NSUInteger index = button ? [self.multiButtons indexOfObject:button] : NSNotFound;
+    if (index == NSNotFound) return;
+    self.draggedButton = button;
+    self.dragOrder = self.multiButtons;
+    self.dragSlot = self.dragStartSlot = (NSInteger)index;
+    self.dragFingerY = point.y;
+    self.dragGrabOffset = point.y - button.center.y;
+    // The finger owns the list now; it scrolls only by the drag's auto-scroll.
+    self.favorites.scrollEnabled = NO;
+    [self.favorites bringSubviewToFront:button];
+    [[[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight] impactOccurred];
+    self.dragFeedback = [UISelectionFeedbackGenerator new];
+    [self.dragFeedback prepare];
+    button.layer.shadowColor = UIColor.blackColor.CGColor;
+    button.layer.shadowOffset = CGSizeMake(0, 4);
+    button.layer.shadowRadius = 10;
+    BOOL reduceMotion = UIAccessibilityIsReduceMotionEnabled();
+    [UIView animateWithDuration:reduceMotion ? 0 : 0.15 animations:^{
+        if (!reduceMotion) button.transform = CGAffineTransformMakeScale(1.06, 1.06);
+        button.layer.shadowOpacity = 0.25;
+    }];
+    self.dragScroll = [CADisplayLink displayLinkWithTarget:self selector:@selector(dragScrollTick:)];
+    [self.dragScroll addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    ApolloLog(@"[DuoFeedRail] multireddit drag began at %ld", (long)index);
+}
+
+// The lifted button follows the finger within the multireddits' span; the
+// others slide to make room where it would land.
+- (void)updateDrag {
+    ApolloDuoFeedRailButton *button = self.draggedButton;
+    if (!button) return;
+    long count = (long)self.multiButtons.count;
+    CGFloat top = self.multiTop;
+    CGFloat centerY = ApolloDuoRailDragCenterY(self.dragFingerY, self.dragGrabOffset, top, kRailFavoriteHeight, count);
+    button.center = CGPointMake(button.center.x, centerY);
+    long slot = ApolloDuoRailMultiDropSlot(centerY, top, kRailFavoriteHeight, count);
+    if (slot < 0 || slot == self.dragSlot) return;
+    self.dragSlot = slot;
+    NSMutableArray<ApolloDuoFeedRailButton *> *order = [self.multiButtons mutableCopy];
+    [order removeObject:button];
+    [order insertObject:button atIndex:(NSUInteger)slot];
+    self.dragOrder = order;
+    [self.dragFeedback selectionChanged];
+    [self.dragFeedback prepare];
+    [UIView animateWithDuration:UIAccessibilityIsReduceMotionEnabled() ? 0 : 0.2 delay:0
+                        options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
+                     animations:^{
+        [self setNeedsLayout];
+        [self layoutIfNeeded];
+    } completion:nil];
+}
+
+// Near the scroll area's top or bottom the list scrolls under the lifted
+// multireddit, so it can travel the whole list. The lifted one's clamped
+// center decides, not the raw finger: past the first or last slot the list
+// stops once that slot is in view instead of scrolling on through the
+// favorites and leaving the lifted one behind.
+- (void)dragScrollTick:(__unused CADisplayLink *)link {
+    UIScrollView *scroll = self.favorites;
+    if (!self.draggedButton) return;
+    CGFloat centerY = ApolloDuoRailDragCenterY(self.dragFingerY, self.dragGrabOffset, self.multiTop,
+                                               kRailFavoriteHeight, (long)self.multiButtons.count);
+    CGFloat step = ApolloDuoRailAutoScrollStep(centerY, scroll.bounds.origin.y, scroll.bounds.size.height, 44, 8);
+    if (step == 0) return;
+    UIEdgeInsets inset = scroll.adjustedContentInset;
+    CGFloat minimum = -inset.top;
+    CGFloat maximum = MAX(minimum, scroll.contentSize.height + inset.bottom - scroll.bounds.size.height);
+    CGFloat offset = MAX(minimum, MIN(maximum, scroll.contentOffset.y + step));
+    CGFloat delta = offset - scroll.contentOffset.y;
+    if (fabs(delta) < 0.01) return;
+    scroll.contentOffset = CGPointMake(scroll.contentOffset.x, offset);
+    // The finger stays put on screen while the content moves under it.
+    self.dragFingerY += delta;
+    [self updateDrag];
+}
+
+// Drops the lifted multireddit in its slot and saves the order, or (cancelled)
+// puts everything back.
+- (void)finishDrag:(BOOL)commit {
+    [self.dragScroll invalidate];
+    self.dragScroll = nil;
+    self.favorites.scrollEnabled = YES;
+    ApolloDuoFeedRailButton *button = self.draggedButton;
+    if (!button) return;
+    NSInteger from = self.dragStartSlot, to = self.dragSlot;
+    BOOL moved = commit && to != from && to >= 0 && to < (NSInteger)self.multiButtons.count;
+    if (moved) {
+        // The rail takes the new order itself, so the store's change notice
+        // finds nothing new to rebuild.
+        NSMutableArray *picks = [self.multiPicks mutableCopy];
+        NSDictionary *pick = picks[(NSUInteger)from];
+        [picks removeObjectAtIndex:(NSUInteger)from];
+        [picks insertObject:pick atIndex:(NSUInteger)to];
+        self.multiPicks = picks;
+        self.multiButtons = self.dragOrder;
+        [self refreshMultiAccessibilityActions];
+    }
+    self.dragOrder = nil;
+    self.draggedButton = nil;
+    self.dragFeedback = nil;
+    [UIView animateWithDuration:UIAccessibilityIsReduceMotionEnabled() ? 0 : 0.2 delay:0
+                        options:UIViewAnimationOptionBeginFromCurrentState | UIViewAnimationOptionAllowUserInteraction
+                     animations:^{
+        button.transform = CGAffineTransformIdentity;
+        button.layer.shadowOpacity = 0;
+        [self setNeedsLayout];
+        [self layoutIfNeeded];
+    } completion:nil];
+    ApolloLog(@"[DuoFeedRail] multireddit drag ended moved=%d (%ld -> %ld)", moved, (long)from, (long)to);
+    if (moved) [ApolloDuoFeedRailMultiStore movePath:button.multiredditPath toActiveIndex:(NSUInteger)to];
+    if (self.reloadAfterDrag) {
+        self.reloadAfterDrag = NO;
+        [self reloadShortcuts];
+    }
+}
+
 - (void)tapped:(ApolloDuoFeedRailButton *)button {
     if (button.tag == kRailSubredditsTag) {
         if (self.toggleSubreddits) self.toggleSubreddits();
     } else if (button.tag == kRailFavoriteTag) {
         if (self.selectSubreddit && button.subreddit.length) self.selectSubreddit(button.subreddit);
+    } else if (button.tag == kRailMultiTag) {
+        if (self.selectMultireddit && button.multiredditPath.length) self.selectMultireddit(button.multiredditPath);
     } else if (self.selectFeed) {
         self.selectFeed(button.tag);
     }

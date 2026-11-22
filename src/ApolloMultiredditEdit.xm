@@ -14,6 +14,8 @@
 #import "ApolloSubredditCustomIconCache.h"
 #import "ApolloClasses.h"
 #import "ApolloSpelling.h"
+#import "ApolloDuoFeedRailMultiStore.h"
+#import "ApolloDuoFeedRailMultis.h"
 
 // MARK: - Multireddit Rename & Descriptions
 //
@@ -220,6 +222,16 @@ static NSString *ApolloMultiEditIconKey(RDKMultireddit *multireddit) {
 static UIImage *ApolloMultiEditCustomIcon(RDKMultireddit *multireddit) {
     NSString *key = ApolloMultiEditIconKey(multireddit);
     return key ? [[ApolloSubredditCustomIconCache sharedCache] cachedIconForSubreddit:key] : nil;
+}
+
+// The custom icon for a multireddit path, for the Duo feed sidebar, which
+// keeps paths rather than models. Same key as ApolloMultiEditIconKey. C
+// linkage: this file builds as Objective-C++ and the sidebar is plain
+// Objective-C.
+extern "C" UIImage *ApolloMultiEditCustomIconForPath(NSString *path) {
+    if (path.length == 0) return nil;
+    NSString *key = [@"multi" stringByAppendingString:[path stringByReplacingOccurrencesOfString:@"/" withString:@"~"]];
+    return [[ApolloSubredditCustomIconCache sharedCache] cachedIconForSubreddit:key];
 }
 
 // The cell's icon image view has no fixed size constraint — it takes the
@@ -736,9 +748,24 @@ static id ApolloMultiEditIssue858InjectedResponse(id responseObject, NSString *m
                     sMultiredditsByClient = [NSMapTable weakToStrongObjectsMapTable];
                 }
                 [sMultiredditsByClient setObject:collection forKey:client];
+                BOOL active = client == ApolloActiveAccountClient();
                 ApolloLog(@"[MultiEdit] captured %lu multireddits for client %p%@",
-                          (unsigned long)collection.count, client,
-                          client == ApolloActiveAccountClient() ? @" (active)" : @"");
+                          (unsigned long)collection.count, client, active ? @" (active)" : @"");
+                // The Duo feed sidebar's picks follow renames and deletions.
+                // The owner is this client's own user, not the saved active
+                // account, which can still name the previous account just
+                // after a switch (and would drop all of its picks).
+                if (active) {
+                    id user = nil;
+                    @try { user = [client valueForKey:@"currentUser"]; }
+                    @catch (__unused NSException *exception) { user = nil; }
+                    id owner = nil;
+                    @try { owner = [user valueForKey:@"username"]; }
+                    @catch (__unused NSException *exception) { owner = nil; }
+                    if ([owner isKindOfClass:[NSString class]]) {
+                        [ApolloDuoFeedRailMultiStore reconcileWithMultireddits:collection owner:owner];
+                    }
+                }
             };
             if ([NSThread isMainThread]) store();
             else dispatch_async(dispatch_get_main_queue(), store);
@@ -777,6 +804,73 @@ static id ApolloMultiEditIssue858InjectedResponse(id responseObject, NSString *m
     %orig;
 }
 
+%end
+
+// MARK: - Duo feed sidebar picks
+
+// Show in Sidebar / Remove from Sidebar on a Multireddits row's long-press
+// menu, while the Duo feed sidebar can show (the Feed Sidebar setting's own
+// visibility, plus the setting itself). Only the signed-in account's own
+// multireddits: the sidebar shows picks by owner.
+static BOOL ApolloMultiEditSidebarPicksAvailable(void) {
+    return sDuoFeedSidebarEnabled && ApolloDeviceIsDuo() && IsLiquidGlass();
+}
+
+// The multireddit whose row Apollo is building a long-press menu for, set
+// only around that %orig so the configuration hook below adds to that menu
+// alone.
+static RDKMultireddit *sApolloMultiEditMenuTarget = nil;
+
+static NSArray<UIMenuElement *> *ApolloMultiEditSidebarActions(RDKMultireddit *multireddit) {
+    NSString *path = [multireddit path];
+    if (path.length == 0) return @[];
+    UIImage *image = [UIImage systemImageNamed:@"sidebar.left"];
+    if ([ApolloDuoFeedRailMultiStore containsPath:path]) {
+        return @[[UIAction actionWithTitle:@"Remove from Sidebar" image:image identifier:nil
+                                   handler:^(__unused UIAction *action) {
+            [ApolloDuoFeedRailMultiStore removePath:path];
+        }]];
+    }
+    return @[[UIAction actionWithTitle:@"Show in Sidebar" image:image identifier:nil
+                               handler:^(__unused UIAction *action) {
+        [ApolloDuoFeedRailMultiStore addPath:path
+                                       title:[ApolloDuoFeedRailMultiStore titleForMultireddit:multireddit]
+                               iconSubreddit:[ApolloDuoFeedRailMultiStore iconSubredditForMultireddit:multireddit]];
+    }]];
+}
+
+// Apollo's menu for the row with the sidebar item appended as its own
+// inline group, or just the item when Apollo has no menu.
+static UIMenu *ApolloMultiEditMenuWithSidebarActions(UIMenu *native, RDKMultireddit *multireddit) {
+    NSArray<UIMenuElement *> *actions = ApolloMultiEditSidebarActions(multireddit);
+    if (actions.count == 0) return native;
+    UIMenu *group = [UIMenu menuWithTitle:@"" image:nil identifier:nil
+                                  options:UIMenuOptionsDisplayInline children:actions];
+    if (![native isKindOfClass:UIMenu.class]) return [UIMenu menuWithChildren:@[group]];
+    return [native menuByReplacingChildren:[native.children arrayByAddingObject:group]];
+}
+
+static char kApolloMultiEditSidebarMenuKey;
+
+// Apollo builds its row menus with
+// +configurationWithIdentifier:previewProvider:actionProvider:; while a
+// Multireddits row's menu is being built, its actions gain the sidebar item.
+%hook UIContextMenuConfiguration
++ (instancetype)configurationWithIdentifier:(id<NSCopying>)identifier
+                            previewProvider:(UIContextMenuContentPreviewProvider)previewProvider
+                             actionProvider:(UIContextMenuActionProvider)actionProvider {
+    RDKMultireddit *multireddit = sApolloMultiEditMenuTarget;
+    if (!multireddit) return %orig;
+    UIContextMenuActionProvider native = [actionProvider copy];
+    UIContextMenuActionProvider provider = ^UIMenu *(NSArray<UIMenuElement *> *suggested) {
+        return ApolloMultiEditMenuWithSidebarActions(native ? native(suggested) : nil, multireddit);
+    };
+    id configuration = %orig(identifier, previewProvider, provider);
+    if (configuration) {
+        objc_setAssociatedObject(configuration, &kApolloMultiEditSidebarMenuKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return configuration;
+}
 %end
 
 // MARK: - Subreddits list hooks
@@ -842,6 +936,54 @@ static id ApolloMultiEditIssue858InjectedResponse(id responseObject, NSString *m
         return;
     }
     [(RedditListViewController *)self apolloMultiEditPresentEditorFor:multireddit prefillName:nil prefillDescription:nil];
+}
+
+// The long-press menu of a Multireddits row gains Show in Sidebar or Remove
+// from Sidebar. The row is found from the touch point, which the Following
+// remap leaves alone, so the indexPath's section space (native or visible,
+// depending on which hook ran first) doesn't matter, and its multireddit is
+// the model cellForRow bound to that cell.
+- (id)tableView:(UITableView *)tableView contextMenuConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath point:(CGPoint)point {
+    if (!ApolloMultiEditSidebarPicksAvailable() || sApolloMultiEditMenuTarget) return %orig;
+    NSIndexPath *visiblePath = [tableView indexPathForRowAtPoint:point];
+    UITableViewCell *cell = visiblePath ? [tableView cellForRowAtIndexPath:visiblePath] : nil;
+    RDKMultireddit *multireddit = cell ? objc_getAssociatedObject(cell, &kApolloMultiEditRowModelKey) : nil;
+    NSString *path = [multireddit respondsToSelector:@selector(path)] ? [multireddit path] : nil;
+    NSString *username = ApolloActiveAccountUsername();
+    if (!path.length || !ApolloDuoRailMultiPathOwnerMatches(path.UTF8String, username.UTF8String)) return %orig;
+
+    // Cleared in @finally: a target left set by a thrown exception would put
+    // this multireddit's item on every later menu in the app.
+    sApolloMultiEditMenuTarget = multireddit;
+    UIContextMenuConfiguration *configuration = nil;
+    @try {
+    configuration = %orig;
+    if (!configuration) {
+        configuration = [UIContextMenuConfiguration configurationWithIdentifier:nil previewProvider:nil
+                                                                 actionProvider:nil];
+    } else if (![objc_getAssociatedObject(configuration, &kApolloMultiEditSidebarMenuKey) boolValue]) {
+        // Built some other way: rebuild it through the factory with Apollo's
+        // own providers, so the hook above appends the item.
+        id actions = nil, preview = nil;
+        @try {
+            actions = [configuration valueForKey:@"actionProvider"];
+            preview = [configuration valueForKey:@"previewProvider"];
+        } @catch (__unused NSException *exception) {
+            actions = nil;
+        }
+        Class blockClass = NSClassFromString(@"NSBlock");
+        if (actions && (!blockClass || [actions isKindOfClass:blockClass])) {
+            configuration = [UIContextMenuConfiguration configurationWithIdentifier:configuration.identifier
+                                                                    previewProvider:preview
+                                                                     actionProvider:actions];
+        } else {
+            ApolloLog(@"[MultiEdit] row menu not extendable; no sidebar item");
+        }
+    }
+    } @finally {
+        sApolloMultiEditMenuTarget = nil;
+    }
+    return configuration;
 }
 
 // A multireddit row's subtitle is the joined list of its subreddits. Swap in
