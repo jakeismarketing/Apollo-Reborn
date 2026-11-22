@@ -396,6 +396,11 @@ static NSString *const UDKeyDuoFeedSidebarEnabled = @"DuoFeedSidebarEnabled";
 // The feed sidebar's look: ApolloDuoFeedSidebarStyle (0 = Rounded, default;
 // 1 = Filled, square and edge to edge).
 static NSString *const UDKeyDuoFeedSidebarStyle = @"DuoFeedSidebarStyle";
+// The multireddits picked for the feed sidebar, in sidebar order: an array of
+// {"path", "title", "icon"} dictionaries (path /user/<owner>/m/<name>; icon is
+// the first member subreddit, for the icon lookup). Every signed-in account's
+// picks share the array; the sidebar shows the active account's.
+static NSString *const UDKeyDuoFeedRailMultireddits = @"DuoFeedRailMultireddits";
 // Subreddit quick-switcher (feed title tap, Posts tab long press): YES = the
 // tweak's Modern search sheet (default on Duo), NO = Apollo's Classic inline popup
 // (default elsewhere; it doesn't carry over a Duo unfold).
