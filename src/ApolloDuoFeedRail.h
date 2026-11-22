@@ -31,9 +31,24 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, copy, nullable) void (^selectFeed)(NSInteger feed);
 @property(nonatomic, copy, nullable) void (^selectSubreddit)(NSString *subreddit);
 @property(nonatomic, copy, nullable) void (^toggleSubreddits)(void);
+/// The collapse arrow at the bottom of the panel was tapped.
+@property(nonatomic, copy, nullable) void (^collapse)(void);
+/// Where the collapse arrow's center sits, in a column (or the host view,
+/// which the column fills from its leading edge) of `bounds` with
+/// `bottomSafeArea`. The collapsed sidebar's reopen arrow sits at the same
+/// point, so the arrow never moves between the two states.
++ (CGPoint)toggleCenterInBounds:(CGRect)bounds bottomSafeArea:(CGFloat)bottomSafeArea;
 /// Rebuilds the buttons when the shortcuts (Popular and All can be hidden in
 /// Settings) or the favorites changed.
 - (void)reloadShortcuts;
+- (void)refreshColors;
+@end
+
+// The sidebar's collapse and reopen arrow: a chevron in a small glass
+// circle. Left (collapse) at the bottom of the open sidebar; right (reopen)
+// left over the feed while the sidebar is collapsed.
+@interface ApolloDuoFeedRailToggleButton : UIControl
+- (instancetype)initPointingRight:(BOOL)pointsRight;
 - (void)refreshColors;
 @end
 

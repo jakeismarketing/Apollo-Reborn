@@ -1,4 +1,5 @@
 #import "ApolloDuoFeedRail.h"
+#import "ApolloDuoFeedRailToggle.h"
 #import "ApolloFeedShortcutsAppearance.h"
 #import "ApolloGalleryImageLoader.h"
 #import "ApolloNativeSubredditIcons.h"
@@ -31,6 +32,10 @@ static const CGFloat kRailSelectionRadius = 16;
 static const CGFloat kRailFavoritesBottomInset = 10;
 static const NSInteger kRailSubredditsTag = -1;
 static const NSInteger kRailFavoriteTag = -2;
+// The collapse arrow: a glass circle this wide, centered in a slot this tall
+// at the bottom of the panel, below the favorites.
+static const CGFloat kRailToggleSize = 32;
+static const CGFloat kRailToggleSlot = 48;
 
 // The highlight is the shade UIKit's lens gives the tab rail's selected tab,
 // darker than the glass (sampled from the rail on iOS 26 and 27), with the
@@ -249,7 +254,67 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
 }
 @end
 
+@interface ApolloDuoFeedRailToggleButton ()
+@property(nonatomic, strong) UIVisualEffectView *glass;
+@property(nonatomic, strong) UIImageView *chevron;
+@end
+
+@implementation ApolloDuoFeedRailToggleButton
+- (instancetype)initPointingRight:(BOOL)pointsRight {
+    if (!(self = [super initWithFrame:CGRectMake(0, 0, kRailToggleSize, kRailToggleSize)])) return nil;
+    UIVisualEffect *effect = nil;
+    if (@available(iOS 26.0, *)) effect = [UIGlassEffect effectWithStyle:UIGlassEffectStyleRegular];
+    else effect = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterial];
+    self.glass = [[UIVisualEffectView alloc] initWithEffect:effect];
+    self.glass.userInteractionEnabled = NO;
+    self.glass.clipsToBounds = YES;
+    if (@available(iOS 26.0, *)) {
+        self.glass.cornerConfiguration = [UICornerConfiguration configurationWithUniformRadius:
+            [UICornerRadius fixedRadius:kRailToggleSize / 2]];
+    } else {
+        self.glass.layer.cornerRadius = kRailToggleSize / 2;
+    }
+    [self addSubview:self.glass];
+    UIImageSymbolConfiguration *symbol = [UIImageSymbolConfiguration configurationWithPointSize:13
+                                                                                         weight:UIImageSymbolWeightSemibold];
+    self.chevron = [[UIImageView alloc] initWithImage:
+        [UIImage systemImageNamed:pointsRight ? @"chevron.right" : @"chevron.left" withConfiguration:symbol]];
+    self.chevron.contentMode = UIViewContentModeCenter;
+    self.chevron.userInteractionEnabled = NO;
+    [self addSubview:self.chevron];
+    self.isAccessibilityElement = YES;
+    self.accessibilityTraits = UIAccessibilityTraitButton;
+    self.accessibilityLabel = pointsRight ? @"Show Sidebar" : @"Hide Sidebar";
+    [self refreshColors];
+    return self;
+}
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    // The circle stays its size and centered whatever room the control has.
+    CGRect circle = CGRectMake((self.bounds.size.width - kRailToggleSize) / 2,
+                               (self.bounds.size.height - kRailToggleSize) / 2, kRailToggleSize, kRailToggleSize);
+    self.glass.frame = circle;
+    self.chevron.frame = circle;
+}
+- (void)setHighlighted:(BOOL)highlighted {
+    [super setHighlighted:highlighted];
+    self.alpha = highlighted ? 0.55 : 1;
+}
+- (void)refreshColors {
+    self.chevron.tintColor = ApolloNavigationChromeColor() ?: UIColor.labelColor;
+}
+- (void)tintColorDidChange {
+    [super tintColorDidChange];
+    [self refreshColors];
+}
+- (void)traitCollectionDidChange:(UITraitCollection *)previous {
+    [super traitCollectionDidChange:previous];
+    [self refreshColors];
+}
+@end
+
 @interface ApolloDuoFeedRail () <UIScrollViewDelegate>
+@property(nonatomic, strong) ApolloDuoFeedRailToggleButton *collapseButton;
 @property(nonatomic, strong) UIVisualEffectView *panel;
 @property(nonatomic, strong) NSArray<ApolloDuoFeedRailButton *> *feedButtons;
 @property(nonatomic, strong) NSArray<ApolloDuoFeedRailButton *> *favoriteButtons;
@@ -268,6 +333,11 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
 + (CGFloat)reservedWidth { return kRailSideInset * 2 + kRailColumnWidth; }
 + (CGFloat)panelMaxXFilled:(BOOL)filled {
     return filled ? ApolloDuoFeedRail.reservedWidth : kRailSideInset + kRailColumnWidth;
+}
++ (CGPoint)toggleCenterInBounds:(CGRect)bounds bottomSafeArea:(CGFloat)bottomSafeArea {
+    return CGPointMake(CGRectGetMinX(bounds) + kRailSideInset + kRailColumnWidth / 2,
+                       CGRectGetMinY(bounds) + ApolloDuoRailToggleCenterY(bounds.size.height, kRailInset,
+                                                                          bottomSafeArea, kRailToggleSlot));
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
@@ -295,6 +365,9 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
     self.subredditsButton.tag = kRailSubredditsTag;
     [self.subredditsButton addTarget:self action:@selector(tapped:) forControlEvents:UIControlEventTouchUpInside];
     [self.panel.contentView addSubview:self.subredditsButton];
+    self.collapseButton = [[ApolloDuoFeedRailToggleButton alloc] initPointingRight:NO];
+    [self.collapseButton addTarget:self action:@selector(collapseTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.panel.contentView addSubview:self.collapseButton];
     self.accessibilityLabel = @"Feeds";
     for (NSString *name in @[ApolloFavoriteSubredditsUpdatedNotification, ApolloFeedShortcutsChangedNotification]) {
         [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(reloadShortcuts) name:name object:nil];
@@ -460,8 +533,15 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
     }
     self.separator.frame = CGRectMake(contentX + 16, contentY + y + 6, columnWidth - 32, hairline * 2);
     y += 12;
-    // The favorites fill the rest of the panel and scroll when they don't fit.
-    self.favorites.frame = CGRectMake(contentX, contentY + y, columnWidth, MAX(0, height - y));
+    // The collapse arrow keeps a slot at the bottom, where the reopen arrow
+    // sits while the sidebar is collapsed; the favorites fill the rest of the
+    // panel above it and scroll when they don't fit.
+    CGPoint toggle = [ApolloDuoFeedRail toggleCenterInBounds:self.bounds bottomSafeArea:self.safeAreaInsets.bottom];
+    CGPoint panelOrigin = self.panel.frame.origin;
+    self.collapseButton.bounds = CGRectMake(0, 0, columnWidth, kRailToggleSlot);
+    self.collapseButton.center = CGPointMake(toggle.x - panelOrigin.x, toggle.y - panelOrigin.y);
+    CGFloat favoritesHeight = ApolloDuoRailFavoritesHeight(panelOrigin.y + contentY + y, toggle.y, kRailToggleSlot);
+    self.favorites.frame = CGRectMake(contentX, contentY + y, columnWidth, favoritesHeight);
     CGFloat favoriteY = 0;
     for (ApolloDuoFeedRailButton *button in self.favoriteButtons) {
         button.frame = CGRectMake(0, favoriteY, columnWidth, kRailFavoriteHeight);
@@ -552,6 +632,7 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
         button.chosen = self.selectedSubreddit && [button.subreddit caseInsensitiveCompare:self.selectedSubreddit] == NSOrderedSame;
         [button applyAccent:accent neutral:neutral];
     }
+    [self.collapseButton refreshColors];
     self.subredditsButton.chosen = self.subredditsSelected;
     [self.subredditsButton applyAccent:accent neutral:neutral];
 }
@@ -569,6 +650,10 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
 - (void)setAlpha:(CGFloat)alpha {
     [super setAlpha:alpha];
     if (alpha > 0.01) [self requestVisibleIcons];
+}
+
+- (void)collapseTapped {
+    if (self.collapse) self.collapse();
 }
 
 - (void)tapped:(ApolloDuoFeedRailButton *)button {

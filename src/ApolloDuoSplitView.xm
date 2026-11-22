@@ -370,6 +370,11 @@ static void ApolloDuoSetThreadDragOffset(UIView *view, CGFloat offset) {
 @property(nonatomic, strong) UIButton *profileBackButton;
 // Landscape: the leading column of feed shortcuts beside feed pages.
 @property(nonatomic, strong) ApolloDuoFeedRail *feedRail;
+// Collapsed with the rail's arrow (saved, UDKeyDuoFeedSidebarCollapsed): the
+// rail hides as for a paired thread, the List button comes back, and this
+// reopen arrow stays where the collapse arrow was.
+@property(nonatomic) BOOL feedRailCollapsed;
+@property(nonatomic, strong) ApolloDuoFeedRailToggleButton *feedRailReopen;
 // Beside the rail: a plain backdrop under UIKit's trailing rail with a divider
 // on its leading edge, so the feed's rows end there instead of running behind
 // the rail. The feed rail draws its own on the leading side.
@@ -850,7 +855,11 @@ static void ApolloDuoEnableListCloseDrags(UIView *view, BOOL enabled) {
     NSUInteger generation = ++self.listAnimationGeneration;
     NSTimeInterval duration = animated && !UIAccessibilityIsReduceMotionEnabled() ? 0.25 : 0;
     [UIView animateWithDuration:duration delay:0 options:UIViewAnimationOptionCurveEaseOut | UIViewAnimationOptionBeginFromCurrentState
-                     animations:^{ self.listDismiss.alpha = visible ? 1 : 0; } completion:nil];
+                     animations:^{
+        self.listDismiss.alpha = visible ? 1 : 0;
+        // The drawer would cover the reopen arrow; it steps aside meanwhile.
+        [self applyFeedRailReopen];
+    } completion:nil];
     __weak typeof(self) weakSelf = self;
     ApolloDuoSlideDrawer(self.listContainer, start, visible ? 0 : -[self listTravel],
                          velocity, animated, ^{
@@ -932,9 +941,46 @@ static void ApolloDuoEnableListCloseDrags(UIView *view, BOOL enabled) {
     return size.width > size.height;
 }
 // Whether the rail shows: a thread paired beside the feed takes its place,
-// and the List button comes back.
+// and the List button comes back. Collapsing it does the same.
 - (BOOL)showsFeedRail {
-    return [self usesFeedRail] && !self.postsColumnsPaired;
+    return [self usesFeedRail] && !self.postsColumnsPaired && ![self feedRailIsCollapsed];
+}
+// Saved state until the rail is built (the first layout asks before it is),
+// then the host's own copy.
+- (BOOL)feedRailIsCollapsed {
+    return self.feedRail ? self.feedRailCollapsed
+        : [NSUserDefaults.standardUserDefaults boolForKey:UDKeyDuoFeedSidebarCollapsed];
+}
+// The reopen arrow shows wherever the rail would if it weren't collapsed,
+// except while the drawer is open over the feed.
+- (BOOL)showsFeedRailReopen {
+    return self.feedRailCollapsed && self.feedRailReopen && [self usesFeedRail] && !self.postsColumnsPaired
+        && !self.listVisible && ApolloDuoFeedRailReservesPage(self.postsNavigation.topViewController);
+}
+- (void)reopenFeedRail { [self setFeedRailCollapsed:NO animated:YES]; }
+- (void)applyFeedRailReopen {
+    if (!self.feedRailReopen) return;
+    BOOL shown = [self showsFeedRailReopen];
+    self.feedRailReopen.alpha = shown ? 1 : 0;
+    self.feedRailReopen.userInteractionEnabled = shown;
+}
+// The rail's collapse arrow, or the reopen arrow: the rail slides away (or
+// back) and the feed takes (or gives back) its width, as when a paired
+// thread takes its place. Remembered across launches.
+- (void)setFeedRailCollapsed:(BOOL)collapsed animated:(BOOL)animated {
+    if (self.feedRailCollapsed == collapsed) return;
+    self.feedRailCollapsed = collapsed;
+    [NSUserDefaults.standardUserDefaults setBool:collapsed forKey:UDKeyDuoFeedSidebarCollapsed];
+    ApolloLog(@"[DuoFeedRail] %@", collapsed ? @"collapsed" : @"reopened");
+    [self.view setNeedsLayout];
+    NSTimeInterval duration = animated && !UIAccessibilityIsReduceMotionEnabled() ? 0.3 : 0;
+    [UIView animateWithDuration:duration delay:0
+                        options:UIViewAnimationOptionCurveEaseInOut | UIViewAnimationOptionBeginFromCurrentState
+                     animations:^{
+        [self.view layoutIfNeeded];
+        // The feed reflows into its new width with the rail.
+        [self.postsNavigation.view layoutIfNeeded];
+    } completion:nil];
 }
 - (void)refreshFeedRailSelection {
     if (!self.feedRail) return;
@@ -961,6 +1007,9 @@ static void ApolloDuoEnableListCloseDrags(UIView *view, BOOL enabled) {
     self.feedRail.transform = shown ? CGAffineTransformIdentity
         : CGAffineTransformMakeTranslation(-ApolloDuoFeedRail.reservedWidth / 2, 0);
     self.feedRail.userInteractionEnabled = shown;
+    // Every path that shows or hides the rail (layout, push and Back, a
+    // paired thread) brings the reopen arrow along, inside its animation.
+    [self applyFeedRailReopen];
 }
 - (void)layoutTrailingBackdrop:(BOOL)rail {
     CGRect bounds = self.view.bounds;
@@ -985,8 +1034,15 @@ static void ApolloDuoEnableListCloseDrags(UIView *view, BOOL enabled) {
     self.feedRail.selectFeed = ^(NSInteger feed) { ApolloDuoFeedRailSelect(weakRailHost, feed); };
     self.feedRail.selectSubreddit = ^(NSString *subreddit) { ApolloDuoFeedRailOpenSubreddit(weakRailHost, subreddit); };
     self.feedRail.toggleSubreddits = ^{ [weakRailHost toggleList]; };
+    self.feedRail.collapse = ^{ [weakRailHost setFeedRailCollapsed:YES animated:YES]; };
     [self.view insertSubview:self.feedRail aboveSubview:self.listContainer];
-    ApolloLog(@"[DuoSplit] feed sidebar built");
+    self.feedRailCollapsed = [NSUserDefaults.standardUserDefaults boolForKey:UDKeyDuoFeedSidebarCollapsed];
+    self.feedRailReopen = [[ApolloDuoFeedRailToggleButton alloc] initPointingRight:YES];
+    self.feedRailReopen.alpha = 0;
+    self.feedRailReopen.userInteractionEnabled = NO;
+    [self.feedRailReopen addTarget:self action:@selector(reopenFeedRail) forControlEvents:UIControlEventTouchUpInside];
+    [self.view insertSubview:self.feedRailReopen aboveSubview:self.feedRail];
+    ApolloLog(@"[DuoSplit] feed sidebar built%@", self.feedRailCollapsed ? @" (collapsed)" : @"");
 }
 - (void)layoutFeedRail:(BOOL)rail {
     // Only built while the setting is on, so the List button's users carry
@@ -997,6 +1053,8 @@ static void ApolloDuoEnableListCloseDrags(UIView *view, BOOL enabled) {
         ApolloDuoFeedRailRelease(self);
         [self.feedRail removeFromSuperview];
         self.feedRail = nil;
+        [self.feedRailReopen removeFromSuperview];
+        self.feedRailReopen = nil;
         [self layoutTrailingBackdrop:NO];
         ApolloLog(@"[DuoSplit] feed sidebar removed (turned off)");
         return;
@@ -1020,6 +1078,10 @@ static void ApolloDuoEnableListCloseDrags(UIView *view, BOOL enabled) {
     [self.feedRail reloadShortcuts];
     [self refreshFeedRailSelection];
     self.feedRail.subredditsSelected = self.listVisible;
+    // The reopen arrow sits exactly where the rail draws its collapse arrow.
+    self.feedRailReopen.bounds = CGRectMake(0, 0, 44, 44);
+    self.feedRailReopen.center = [ApolloDuoFeedRail toggleCenterInBounds:self.view.bounds
+                                                          bottomSafeArea:self.view.safeAreaInsets.bottom];
     // A push or Back moves the rail with its own transition.
     if (self.feedRailTransitioning || self.postsNavigation.transitionCoordinator) return;
     UIViewController *top = self.postsNavigation.topViewController;

@@ -396,6 +396,9 @@ static NSString *const UDKeyDuoFeedSidebarEnabled = @"DuoFeedSidebarEnabled";
 // The feed sidebar's look: ApolloDuoFeedSidebarStyle (0 = Rounded, default;
 // 1 = Filled, square and edge to edge).
 static NSString *const UDKeyDuoFeedSidebarStyle = @"DuoFeedSidebarStyle";
+// The feed sidebar tucked away with its collapse arrow: NO = open (default),
+// YES = collapsed, the feed full width with a reopen arrow in its corner.
+static NSString *const UDKeyDuoFeedSidebarCollapsed = @"DuoFeedSidebarCollapsed";
 // Subreddit quick-switcher (feed title tap, Posts tab long press): YES = the
 // tweak's Modern search sheet (default on Duo), NO = Apollo's Classic inline popup
 // (default elsewhere; it doesn't carry over a Duo unfold).
