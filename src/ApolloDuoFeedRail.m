@@ -1,4 +1,6 @@
 #import "ApolloDuoFeedRail.h"
+#import "ApolloDuoFeedRailMultiStore.h"
+#import "ApolloDuoFeedRailMultis.h"
 #import "ApolloFeedShortcutsAppearance.h"
 #import "ApolloGalleryImageLoader.h"
 #import "ApolloNativeSubredditIcons.h"
@@ -30,6 +32,20 @@ static const CGFloat kRailSelectionRadius = 16;
 static const CGFloat kRailFavoritesBottomInset = 10;
 static const NSInteger kRailSubredditsTag = -1;
 static const NSInteger kRailFavoriteTag = -2;
+static const NSInteger kRailMultiTag = -3;
+
+// A multireddit's custom icon (ApolloMultiredditEdit.xm), by path.
+extern UIImage *ApolloMultiEditCustomIconForPath(NSString *path);
+
+// Reddit's model path and the feed's own path can differ in case and in a
+// trailing slash; both name the same multireddit.
+BOOL ApolloDuoFeedRailSameMultiredditPath(NSString *a, NSString *b) {
+    if (!a.length || !b.length) return NO;
+    NSCharacterSet *slash = [NSCharacterSet characterSetWithCharactersInString:@"/"];
+    NSString *left = [a stringByTrimmingCharactersInSet:slash];
+    NSString *right = [b stringByTrimmingCharactersInSet:slash];
+    return [left caseInsensitiveCompare:right] == NSOrderedSame;
+}
 
 // The highlight is the shade UIKit's lens gives the tab rail's selected tab,
 // darker than the glass (sampled from the rail on iOS 26 and 27), with the
@@ -75,6 +91,9 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
 @property(nonatomic, strong) UILabel *initial;
 @property(nonatomic, strong) UILabel *label;
 @property(nonatomic, copy) NSString *subreddit;
+// A picked multireddit's path; its `subreddit` is then the first member
+// subreddit, whose icon it shows when it has no custom one.
+@property(nonatomic, copy) NSString *multiredditPath;
 @property(nonatomic, strong) ApolloGalleryImageRequest *iconRequest;
 // The subreddit info lookup has been asked for (once, when first in view).
 @property(nonatomic) BOOL infoRequested;
@@ -161,6 +180,22 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
     self.initial.layer.cornerRadius = kRailAvatarSize / 2;
     [self insertSubview:self.initial belowSubview:self.icon];
     [self loadIconFromURL:iconURL];
+    return self;
+}
+// A picked multireddit: its name over its custom icon, or over its first
+// member subreddit's icon once that loads, its first letter until then.
+- (instancetype)initWithMultiredditPath:(NSString *)path title:(NSString *)title iconSubreddit:(NSString *)iconSubreddit {
+    if (!(self = [self initWithSubreddit:title iconURL:nil])) return nil;
+    self.multiredditPath = path;
+    self.subreddit = iconSubreddit;
+    self.accessibilityLabel = [title stringByAppendingString:@", multireddit"];
+    self.initial.text = title.length ? [title substringToIndex:1].uppercaseString : @"m";
+    UIImage *custom = ApolloMultiEditCustomIconForPath(path);
+    if (custom) {
+        self.hasIcon = YES;
+        self.icon.image = custom;
+        self.initial.hidden = YES;
+    }
     return self;
 }
 - (void)loadIconFromURL:(NSURL *)url {
@@ -260,6 +295,11 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
 @property(nonatomic, copy) NSArray<NSNumber *> *shortcuts;
 @property(nonatomic) NSInteger shortcutStyle;
 @property(nonatomic, copy) NSArray<NSString *> *favoriteNames;
+// The picked multireddits, after the favorites in the same scroll area.
+@property(nonatomic, strong) NSArray<ApolloDuoFeedRailButton *> *multiButtons;
+@property(nonatomic, copy) NSArray<NSDictionary<NSString *, NSString *> *> *multiPicks;
+// The multireddit a held press lifted, while it is dragged.
+@property(nonatomic, weak) ApolloDuoFeedRailButton *draggedButton;
 @end
 
 @implementation ApolloDuoFeedRail
@@ -292,7 +332,8 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
     [self.subredditsButton addTarget:self action:@selector(tapped:) forControlEvents:UIControlEventTouchUpInside];
     [self.panel.contentView addSubview:self.subredditsButton];
     self.accessibilityLabel = @"Feeds";
-    for (NSString *name in @[ApolloFavoriteSubredditsUpdatedNotification, ApolloFeedShortcutsChangedNotification]) {
+    for (NSString *name in @[ApolloFavoriteSubredditsUpdatedNotification, ApolloFeedShortcutsChangedNotification,
+                             ApolloDuoFeedRailMultisChangedNotification]) {
         [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(reloadShortcuts) name:name object:nil];
     }
     // Apollo saves a star from the subreddit list (or a confirmed unfavorite)
@@ -337,7 +378,9 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
     BOOL shortcutsChanged = !self.feedButtons || ![shortcuts isEqualToArray:self.shortcuts ?: @[]]
         || style != self.shortcutStyle;
     BOOL favoritesChanged = !self.favoriteButtons || ![names isEqualToArray:self.favoriteNames ?: @[]];
-    if (!shortcutsChanged && !favoritesChanged) return;
+    NSArray<NSDictionary<NSString *, NSString *> *> *picks = [ApolloDuoFeedRailMultiStore picksForActiveAccount];
+    BOOL multisChanged = !self.multiButtons || ![picks isEqualToArray:self.multiPicks ?: @[]];
+    if (!shortcutsChanged && !favoritesChanged && !multisChanged) return;
     if (shortcutsChanged) {
         self.shortcuts = shortcuts;
         self.shortcutStyle = style;
@@ -382,6 +425,30 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
             [buttons addObject:button];
         }
         self.favoriteButtons = buttons;
+    }
+    if (multisChanged) {
+        if (self.multiPicks) ApolloLog(@"[DuoFeedRail] multireddit picks changed: %lu", (unsigned long)picks.count);
+        self.multiPicks = picks;
+        for (UIView *view in self.multiButtons) [view removeFromSuperview];
+        NSDictionary<NSString *, NSURL *> *icons = picks.count
+            ? ApolloNativeSubredditIconURLs([NSUserDefaults.standardUserDefaults dataForKey:@"SubredditIconData"]) : @{};
+        NSMutableArray<ApolloDuoFeedRailButton *> *buttons = [NSMutableArray array];
+        for (NSDictionary<NSString *, NSString *> *pick in picks) {
+            NSString *path = pick[@"path"];
+            NSString *title = pick[@"title"] ?: path.lastPathComponent;
+            NSString *iconSubreddit = pick[@"icon"];
+            ApolloDuoFeedRailButton *button = [[ApolloDuoFeedRailButton alloc] initWithMultiredditPath:path title:title
+                                                                                          iconSubreddit:iconSubreddit];
+            if (!button.hasIcon && iconSubreddit.length) {
+                [button loadIconFromURL:[ApolloSubredditInfoCache.sharedCache cachedInfoForSubreddit:iconSubreddit].iconURL
+                    ?: icons[iconSubreddit.lowercaseString]];
+            }
+            button.tag = kRailMultiTag;
+            [button addTarget:self action:@selector(tapped:) forControlEvents:UIControlEventTouchUpInside];
+            [self.favorites addSubview:button];
+            [buttons addObject:button];
+        }
+        self.multiButtons = buttons;
     }
     [self refreshColors];
     [self setNeedsLayout];
@@ -466,9 +533,15 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
         button.frame = CGRectMake(0, favoriteY, columnWidth, kRailFavoriteHeight);
         favoriteY += kRailFavoriteHeight;
     }
+    // The picked multireddits follow, in their saved order. A dragged one is
+    // placed by the drag instead.
+    for (ApolloDuoFeedRailButton *button in self.multiButtons) {
+        if (button != self.draggedButton) button.frame = CGRectMake(0, favoriteY, columnWidth, kRailFavoriteHeight);
+        favoriteY += kRailFavoriteHeight;
+    }
     self.favorites.contentSize = CGSizeMake(columnWidth, favoriteY);
     self.favorites.alwaysBounceVertical = favoriteY + kRailFavoritesBottomInset > self.favorites.bounds.size.height;
-    self.separator.hidden = self.favoriteButtons.count == 0;
+    self.separator.hidden = self.favoriteButtons.count + self.multiButtons.count == 0;
     [self requestVisibleIcons];
 }
 
@@ -479,8 +552,10 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
 - (void)requestVisibleIcons {
     if (!self.window || self.hidden || self.alpha < 0.01) return;
     CGRect visible = self.favorites.bounds;
-    for (ApolloDuoFeedRailButton *button in self.favoriteButtons) {
-        if (button.hasIcon || button.infoRequested || !CGRectIntersectsRect(button.frame, visible)) continue;
+    NSArray<ApolloDuoFeedRailButton *> *buttons = [self.favoriteButtons ?: @[] arrayByAddingObjectsFromArray:self.multiButtons ?: @[]];
+    for (ApolloDuoFeedRailButton *button in buttons) {
+        if (button.hasIcon || button.infoRequested || !button.subreddit.length
+            || !CGRectIntersectsRect(button.frame, visible)) continue;
         button.infoRequested = YES;
         __weak ApolloDuoFeedRailButton *weakButton = button;
         NSString *username = ApolloDuoFeedRailUsername(button.subreddit);
@@ -525,6 +600,13 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
     [self refreshColors];
 }
 
+- (void)setSelectedMultiredditPath:(NSString *)selectedMultiredditPath {
+    if (_selectedMultiredditPath == selectedMultiredditPath
+        || [_selectedMultiredditPath isEqualToString:selectedMultiredditPath]) return;
+    _selectedMultiredditPath = [selectedMultiredditPath copy];
+    [self refreshColors];
+}
+
 - (void)setSubredditsSelected:(BOOL)subredditsSelected {
     if (_subredditsSelected == subredditsSelected) return;
     _subredditsSelected = subredditsSelected;
@@ -551,6 +633,10 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
         button.chosen = self.selectedSubreddit && [button.subreddit caseInsensitiveCompare:self.selectedSubreddit] == NSOrderedSame;
         [button applyAccent:accent neutral:neutral];
     }
+    for (ApolloDuoFeedRailButton *button in self.multiButtons) {
+        button.chosen = ApolloDuoFeedRailSameMultiredditPath(button.multiredditPath, self.selectedMultiredditPath);
+        [button applyAccent:accent neutral:neutral];
+    }
     self.subredditsButton.chosen = self.subredditsSelected;
     [self.subredditsButton applyAccent:accent neutral:neutral];
 }
@@ -575,6 +661,8 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
         if (self.toggleSubreddits) self.toggleSubreddits();
     } else if (button.tag == kRailFavoriteTag) {
         if (self.selectSubreddit && button.subreddit.length) self.selectSubreddit(button.subreddit);
+    } else if (button.tag == kRailMultiTag) {
+        if (self.selectMultireddit && button.multiredditPath.length) self.selectMultireddit(button.multiredditPath);
     } else if (self.selectFeed) {
         self.selectFeed(button.tag);
     }
