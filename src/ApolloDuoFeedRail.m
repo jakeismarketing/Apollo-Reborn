@@ -357,6 +357,12 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
                              ApolloDuoFeedRailMultisChangedNotification]) {
         [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(reloadShortcuts) name:name object:nil];
     }
+    // Another account's picks show after a switch, even with the Posts feed
+    // left on screen.
+    for (NSString *name in @[@"com.christianselig.RedditCurrentAccountChanged",
+                             @"com.christianselig.RedditAccountChanged"]) {
+        [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(accountChanged) name:name object:nil];
+    }
     // Apollo saves a star from the subreddit list (or a confirmed unfavorite)
     // without posting anything, so the column watches the saved list itself.
     [NSUserDefaults.standardUserDefaults addObserver:self forKeyPath:UDKeyApolloFavoriteSubreddits options:0
@@ -379,6 +385,18 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
     // pass writes again) rebuilds once, the rest find nothing new.
     __weak ApolloDuoFeedRail *weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf reloadShortcuts]; });
+}
+
+// The signed-in username can settle a moment after the switch is announced,
+// so the picks are read again shortly after too.
+- (void)accountChanged {
+    __weak ApolloDuoFeedRail *weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [weakSelf reloadShortcuts];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [weakSelf reloadShortcuts];
+        });
+    });
 }
 
 - (void)reloadShortcuts {
@@ -470,29 +488,12 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
                     ?: icons[iconSubreddit.lowercaseString]];
             }
             button.tag = kRailMultiTag;
-            // VoiceOver can't drag; it moves a multireddit one place at a time.
-            NSUInteger index = buttons.count;
-            NSMutableArray<UIAccessibilityCustomAction *> *moves = [NSMutableArray array];
-            if (index > 0) {
-                [moves addObject:[[UIAccessibilityCustomAction alloc] initWithName:@"Move Up"
-                                                                    actionHandler:^BOOL(__unused UIAccessibilityCustomAction *action) {
-                    [ApolloDuoFeedRailMultiStore movePath:path toActiveIndex:index - 1];
-                    return YES;
-                }]];
-            }
-            if (index + 1 < picks.count) {
-                [moves addObject:[[UIAccessibilityCustomAction alloc] initWithName:@"Move Down"
-                                                                    actionHandler:^BOOL(__unused UIAccessibilityCustomAction *action) {
-                    [ApolloDuoFeedRailMultiStore movePath:path toActiveIndex:index + 1];
-                    return YES;
-                }]];
-            }
-            button.accessibilityCustomActions = moves;
             [button addTarget:self action:@selector(tapped:) forControlEvents:UIControlEventTouchUpInside];
             [self.favorites addSubview:button];
             [buttons addObject:button];
         }
         self.multiButtons = buttons;
+        [self refreshMultiAccessibilityActions];
     }
     [self refreshColors];
     [self setNeedsLayout];
@@ -709,6 +710,37 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
 
 #pragma mark - Drag to reorder
 
+// VoiceOver can't drag; it moves a multireddit one place at a time. Rebuilt
+// whenever the order changes (a rebuild or a drop), and each action reads the
+// button's current place when it runs.
+- (void)refreshMultiAccessibilityActions {
+    NSUInteger count = self.multiButtons.count;
+    __weak ApolloDuoFeedRail *weakSelf = self;
+    [self.multiButtons enumerateObjectsUsingBlock:^(ApolloDuoFeedRailButton *button, NSUInteger index, __unused BOOL *stop) {
+        __weak ApolloDuoFeedRailButton *weakButton = button;
+        BOOL (^move)(NSInteger) = ^BOOL(NSInteger step) {
+            ApolloDuoFeedRail *rail = weakSelf;
+            ApolloDuoFeedRailButton *moving = weakButton;
+            NSUInteger current = moving ? [rail.multiButtons indexOfObject:moving] : NSNotFound;
+            if (!rail || current == NSNotFound || !moving.multiredditPath.length) return NO;
+            NSInteger target = (NSInteger)current + step;
+            if (target < 0 || target >= (NSInteger)rail.multiButtons.count) return NO;
+            [ApolloDuoFeedRailMultiStore movePath:moving.multiredditPath toActiveIndex:(NSUInteger)target];
+            return YES;
+        };
+        NSMutableArray<UIAccessibilityCustomAction *> *moves = [NSMutableArray array];
+        if (index > 0) {
+            [moves addObject:[[UIAccessibilityCustomAction alloc] initWithName:@"Move Up"
+                actionHandler:^BOOL(__unused UIAccessibilityCustomAction *action) { return move(-1); }]];
+        }
+        if (index + 1 < count) {
+            [moves addObject:[[UIAccessibilityCustomAction alloc] initWithName:@"Move Down"
+                actionHandler:^BOOL(__unused UIAccessibilityCustomAction *action) { return move(1); }]];
+        }
+        button.accessibilityCustomActions = moves;
+    }];
+}
+
 // The picked multireddit under a point in the scroll area's content, or nil.
 - (ApolloDuoFeedRailButton *)multiButtonAtPoint:(CGPoint)point {
     for (ApolloDuoFeedRailButton *button in self.multiButtons) {
@@ -777,9 +809,7 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
     if (!button) return;
     long count = (long)self.multiButtons.count;
     CGFloat top = self.multiTop;
-    CGFloat half = kRailFavoriteHeight / 2;
-    CGFloat centerY = MAX(top + half, MIN(top + (count - 1) * kRailFavoriteHeight + half,
-                                          self.dragFingerY - self.dragGrabOffset));
+    CGFloat centerY = ApolloDuoRailDragCenterY(self.dragFingerY, self.dragGrabOffset, top, kRailFavoriteHeight, count);
     button.center = CGPointMake(button.center.x, centerY);
     long slot = ApolloDuoRailMultiDropSlot(centerY, top, kRailFavoriteHeight, count);
     if (slot < 0 || slot == self.dragSlot) return;
@@ -798,12 +828,17 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
     } completion:nil];
 }
 
-// Near the scroll area's top or bottom the list scrolls under the finger, so
-// a multireddit can travel the whole list.
+// Near the scroll area's top or bottom the list scrolls under the lifted
+// multireddit, so it can travel the whole list. The lifted one's clamped
+// center decides, not the raw finger: past the first or last slot the list
+// stops once that slot is in view instead of scrolling on through the
+// favorites and leaving the lifted one behind.
 - (void)dragScrollTick:(__unused CADisplayLink *)link {
     UIScrollView *scroll = self.favorites;
     if (!self.draggedButton) return;
-    CGFloat step = ApolloDuoRailAutoScrollStep(self.dragFingerY, scroll.bounds.origin.y, scroll.bounds.size.height, 44, 8);
+    CGFloat centerY = ApolloDuoRailDragCenterY(self.dragFingerY, self.dragGrabOffset, self.multiTop,
+                                               kRailFavoriteHeight, (long)self.multiButtons.count);
+    CGFloat step = ApolloDuoRailAutoScrollStep(centerY, scroll.bounds.origin.y, scroll.bounds.size.height, 44, 8);
     if (step == 0) return;
     UIEdgeInsets inset = scroll.adjustedContentInset;
     CGFloat minimum = -inset.top;
@@ -836,6 +871,7 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
         [picks insertObject:pick atIndex:(NSUInteger)to];
         self.multiPicks = picks;
         self.multiButtons = self.dragOrder;
+        [self refreshMultiAccessibilityActions];
     }
     self.dragOrder = nil;
     self.draggedButton = nil;

@@ -23,10 +23,10 @@ FOUNDATION_EXPORT NSString *const ApolloDuoFeedRailMultisChangedNotification;
 /// Moves a pick to `index` among the active account's picks. Other accounts'
 /// picks keep their order.
 + (void)movePath:(NSString *)path toActiveIndex:(NSUInteger)index;
-/// The active account's multireddit list (RDKMultireddit objects) just
-/// loaded: drops that account's picks it no longer has and refreshes their
-/// titles and icons. Does nothing for an empty list.
-+ (void)reconcileWithMultireddits:(NSArray *)multireddits;
+/// `owner`'s multireddit list (RDKMultireddit objects) just loaded: drops
+/// that account's picks it no longer has and refreshes their titles and
+/// icons. Other accounts' picks are untouched. Does nothing for an empty list.
++ (void)reconcileWithMultireddits:(NSArray *)multireddits owner:(NSString *)owner;
 /// The title and icon subreddit to save for an RDKMultireddit.
 + (nullable NSString *)titleForMultireddit:(id)multireddit;
 + (nullable NSString *)iconSubredditForMultireddit:(id)multireddit;

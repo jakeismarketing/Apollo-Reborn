@@ -225,8 +225,10 @@ static UIImage *ApolloMultiEditCustomIcon(RDKMultireddit *multireddit) {
 }
 
 // The custom icon for a multireddit path, for the Duo feed sidebar, which
-// keeps paths rather than models. Same key as ApolloMultiEditIconKey.
-UIImage *ApolloMultiEditCustomIconForPath(NSString *path) {
+// keeps paths rather than models. Same key as ApolloMultiEditIconKey. C
+// linkage: this file builds as Objective-C++ and the sidebar is plain
+// Objective-C.
+extern "C" UIImage *ApolloMultiEditCustomIconForPath(NSString *path) {
     if (path.length == 0) return nil;
     NSString *key = [@"multi" stringByAppendingString:[path stringByReplacingOccurrencesOfString:@"/" withString:@"~"]];
     return [[ApolloSubredditCustomIconCache sharedCache] cachedIconForSubreddit:key];
@@ -750,7 +752,20 @@ static id ApolloMultiEditIssue858InjectedResponse(id responseObject, NSString *m
                 ApolloLog(@"[MultiEdit] captured %lu multireddits for client %p%@",
                           (unsigned long)collection.count, client, active ? @" (active)" : @"");
                 // The Duo feed sidebar's picks follow renames and deletions.
-                if (active) [ApolloDuoFeedRailMultiStore reconcileWithMultireddits:collection];
+                // The owner is this client's own user, not the saved active
+                // account, which can still name the previous account just
+                // after a switch (and would drop all of its picks).
+                if (active) {
+                    id user = nil;
+                    @try { user = [client valueForKey:@"currentUser"]; }
+                    @catch (__unused NSException *exception) { user = nil; }
+                    id owner = nil;
+                    @try { owner = [user valueForKey:@"username"]; }
+                    @catch (__unused NSException *exception) { owner = nil; }
+                    if ([owner isKindOfClass:[NSString class]]) {
+                        [ApolloDuoFeedRailMultiStore reconcileWithMultireddits:collection owner:owner];
+                    }
+                }
             };
             if ([NSThread isMainThread]) store();
             else dispatch_async(dispatch_get_main_queue(), store);
@@ -937,8 +952,12 @@ static char kApolloMultiEditSidebarMenuKey;
     NSString *username = ApolloActiveAccountUsername();
     if (!path.length || !ApolloDuoRailMultiPathOwnerMatches(path.UTF8String, username.UTF8String)) return %orig;
 
+    // Cleared in @finally: a target left set by a thrown exception would put
+    // this multireddit's item on every later menu in the app.
     sApolloMultiEditMenuTarget = multireddit;
-    UIContextMenuConfiguration *configuration = %orig;
+    UIContextMenuConfiguration *configuration = nil;
+    @try {
+    configuration = %orig;
     if (!configuration) {
         configuration = [UIContextMenuConfiguration configurationWithIdentifier:nil previewProvider:nil
                                                                  actionProvider:nil];
@@ -961,7 +980,9 @@ static char kApolloMultiEditSidebarMenuKey;
             ApolloLog(@"[MultiEdit] row menu not extendable; no sidebar item");
         }
     }
-    sApolloMultiEditMenuTarget = nil;
+    } @finally {
+        sApolloMultiEditMenuTarget = nil;
+    }
     return configuration;
 }
 

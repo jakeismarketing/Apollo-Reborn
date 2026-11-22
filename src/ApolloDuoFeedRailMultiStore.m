@@ -123,8 +123,8 @@ static NSString *ApolloDuoRailMultiString(id object, SEL selector) {
     ApolloDuoRailMultiSave(picks, previous);
 }
 
-+ (void)reconcileWithMultireddits:(NSArray *)multireddits {
-    NSString *username = ApolloActiveAccountUsername();
++ (void)reconcileWithMultireddits:(NSArray *)multireddits owner:(NSString *)owner {
+    NSString *username = owner;
     if (!username.length || !multireddits.count) return;
     NSMutableDictionary<NSString *, id> *byPath = [NSMutableDictionary dictionary];
     for (id multireddit in multireddits) {

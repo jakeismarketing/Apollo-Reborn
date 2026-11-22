@@ -40,6 +40,16 @@ int main(void) {
     Check(ApolloDuoRailMultiDropSlot(130, 100, 60, 0) == -1, "empty list");
     Check(ApolloDuoRailMultiDropSlot(130, 100, 0, 3) == -1, "zero row height");
 
+    /* The lifted multireddit's center: under the finger less where it was
+       grabbed, kept within the multireddits' span. Auto-scroll reads this,
+       not the raw finger, so a finger above the first slot doesn't scroll
+       the list up through the favorites. */
+    Check(ApolloDuoRailDragCenterY(200, 10, 100, 60, 3) == 190, "follows the finger");
+    Check(ApolloDuoRailDragCenterY(20, 10, 100, 60, 3) == 130, "above clamps to the first center");
+    Check(ApolloDuoRailDragCenterY(900, 10, 100, 60, 3) == 250, "below clamps to the last center");
+    Check(ApolloDuoRailAutoScrollStep(ApolloDuoRailDragCenterY(85, 0, 100, 60, 3), 80, 400, 44, 8) == 0,
+          "finger at the view's top edge, first slot in view: no scroll up");
+
     /* Auto-scroll while dragging near the scroll area's top or bottom. */
     Check(ApolloDuoRailAutoScrollStep(105, 100, 400, 40, 8) < 0, "near top scrolls up");
     Check(ApolloDuoRailAutoScrollStep(495, 100, 400, 40, 8) > 0, "near bottom scrolls down");

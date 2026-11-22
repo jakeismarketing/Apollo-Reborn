@@ -45,6 +45,18 @@ static inline long ApolloDuoRailMultiDropSlot(double centerY, double firstTop, d
     return slot >= count ? count - 1 : slot;
 }
 
+// Where the lifted multireddit's center sits: the finger's y less the offset
+// it was grabbed at, kept between the first and last of `count` rows of
+// `rowHeight` from `firstTop`.
+static inline double ApolloDuoRailDragCenterY(double fingerY, double grabOffset, double firstTop,
+                                             double rowHeight, long count) {
+    double half = rowHeight / 2;
+    double first = firstTop + half;
+    double last = firstTop + (count > 0 ? count - 1 : 0) * rowHeight + half;
+    double center = fingerY - grabOffset;
+    return center < first ? first : center > last ? last : center;
+}
+
 // Points to scroll per frame while a finger at `fingerY` drags in a visible
 // area from `visibleTop` that is `visibleHeight` tall: negative within `edge`
 // of the top, positive within `edge` of the bottom, growing linearly to
