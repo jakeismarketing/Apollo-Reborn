@@ -401,9 +401,14 @@ static void ApolloDuoSetThreadDragOffset(UIView *view, CGFloat offset) {
 @property(nonatomic, weak) UIViewController *feedTransitionThread;
 - (BOOL)usesFeedRail;
 - (BOOL)showsFeedRail;
+// The rail is collapsed with its arrow (the saved state until it is built).
+- (BOOL)feedRailIsCollapsed;
+// Shows or hides the reopen arrow for where the feed stands now.
+- (void)applyFeedRailReopen;
 - (void)toggleList;
 @end
 static void ApolloDuoColumnScrubFinishNow(ApolloDuoSplitHost *host);
+static void ApolloDuoFeedRailApplyCollapse(ApolloDuoSplitHost *host, BOOL collapsed, BOOL animated);
 
 @implementation ApolloDuoSplitHost
 - (void)viewDidLoad {
@@ -969,18 +974,11 @@ static void ApolloDuoEnableListCloseDrags(UIView *view, BOOL enabled) {
 // thread takes its place. Remembered across launches.
 - (void)setFeedRailCollapsed:(BOOL)collapsed animated:(BOOL)animated {
     if (self.feedRailCollapsed == collapsed) return;
-    self.feedRailCollapsed = collapsed;
     [NSUserDefaults.standardUserDefaults setBool:collapsed forKey:UDKeyDuoFeedSidebarCollapsed];
     ApolloLog(@"[DuoFeedRail] %@", collapsed ? @"collapsed" : @"reopened");
-    [self.view setNeedsLayout];
-    NSTimeInterval duration = animated && !UIAccessibilityIsReduceMotionEnabled() ? 0.3 : 0;
-    [UIView animateWithDuration:duration delay:0
-                        options:UIViewAnimationOptionCurveEaseInOut | UIViewAnimationOptionBeginFromCurrentState
-                     animations:^{
-        [self.view layoutIfNeeded];
-        // The feed reflows into its new width with the rail.
-        [self.postsNavigation.view layoutIfNeeded];
-    } completion:nil];
+    // The feed changes width as when a thread pairs, so it moves the same
+    // way: the reader's place kept and the columns' geometry replayed.
+    ApolloDuoFeedRailApplyCollapse(self, collapsed, animated);
 }
 - (void)refreshFeedRailSelection {
     if (!self.feedRail) return;
@@ -1112,6 +1110,8 @@ static void ApolloDuoEnableListCloseDrags(UIView *view, BOOL enabled) {
     if (opening && !self.listVisible) {
         self.listVisible = YES;
         [self prepareListReveal];
+        // The drawer drags in over the reopen arrow's corner.
+        [UIView animateWithDuration:0.15 animations:^{ [self applyFeedRailReopen]; }];
     }
     self.listDragging = YES;
     self.listContainer.hidden = NO;
@@ -1705,7 +1705,7 @@ CGFloat ApolloDuoSplitTransitionContentWidth(UIView *view, CGFloat trailingInset
         BOOL feedColumn = paired && owner.navigationController == state.feed;
         // Feed pages sit beside the leading rail while it's on, unless a thread pairs.
         CGFloat rail = sDuoFeedSidebarEnabled && landscape && !feedColumn && state.host.subredditList
-            && owner.navigationController == state.feed
+            && ![state.host feedRailIsCollapsed] && owner.navigationController == state.feed
             && ApolloDuoFeedRailReservesPage(owner) ? ApolloDuoFeedRail.reservedWidth : 0;
         return MAX(0, width - rail - (!feedColumn && landscape ? trailingInset : 0));
     }
@@ -2282,8 +2282,16 @@ static void ApolloDuoFeedRailRelease(ApolloDuoSplitHost *host) {
 // with animations off (the columns replay their own geometry), so they move
 // from where they were over the columns' duration.
 static void ApolloDuoFeedRailAnimateChange(ApolloDuoSplitHost *host, BOOL railWasShown, BOOL backdropWasHidden,
-                                           NSTimeInterval duration) {
+                                           BOOL reopenWasShown, NSTimeInterval duration) {
     if (!host.feedRail) return;
+    // Collapsed, the reopen arrow comes and goes in the rail's place.
+    UIView *reopen = host.feedRailReopen;
+    BOOL reopenShown = reopen.alpha > 0.5;
+    if (reopen && reopenShown != reopenWasShown) {
+        [UIView performWithoutAnimation:^{ reopen.alpha = reopenWasShown ? 1 : 0; }];
+        [UIView animateWithDuration:duration delay:0 options:UIViewAnimationOptionCurveEaseInOut
+                         animations:^{ reopen.alpha = reopenShown ? 1 : 0; } completion:nil];
+    }
     BOOL shown = host.feedRail.alpha > 0.5;
     if (shown != railWasShown) {
         [UIView performWithoutAnimation:^{ [host setFeedRailShown:railWasShown]; }];
@@ -2324,6 +2332,10 @@ static void ApolloDuoFeedTransitionTick(ApolloDuoSplitHost *host) {
         CGFloat shown = MAX(0, MIN(1, ApolloDuoPresentedOffset(thread.view, container) / travel));
         host.feedRail.alpha = shown;
         host.feedRail.transform = CGAffineTransformMakeTranslation(-(1 - shown) * ApolloDuoFeedRail.reservedWidth / 2, 0);
+    } else if (thread.isViewLoaded && host.feedRailReopen && [host feedRailIsCollapsed] && [host usesFeedRail]
+               && !host.postsColumnsPaired && !host.listVisible) {
+        // Collapsed, the reopen arrow follows the full-width page instead.
+        host.feedRailReopen.alpha = MAX(0, MIN(1, ApolloDuoPresentedOffset(thread.view, container) / travel));
     }
 }
 
@@ -2379,6 +2391,8 @@ static void ApolloDuoFeedRailFollowNavigation(ApolloDuoSplitHost *host) {
     UIViewController *thread = railMoves ? (ApolloDuoFeedRailReservesPage(to) ? from : to) : nil;
     ApolloDuoFeedTransitionStartTracking(host, thread);
     if (shown && thread) host.feedRail.userInteractionEnabled = NO;
+    // Nor is the reopen arrow tapped mid-transition; the completion settles it.
+    if (thread) host.feedRailReopen.userInteractionEnabled = NO;
     __weak ApolloDuoSplitHost *weakHost = host;
     __weak UIViewController *weakFrom = from;
     [coordinator animateAlongsideTransition:^(__unused id<UIViewControllerTransitionCoordinatorContext> context) {
@@ -3900,6 +3914,68 @@ static void ApolloDuoPostsApplyDetailStack(ApolloDuoSplitState *state, NSArray<U
     }];
 }
 
+// The rail's collapse or reopen arrow. The feed gains or gives back the
+// rail's width, the same rewrap a thread pairing makes, so it moves the same
+// way: geometry captured before, the new layout applied with animation off,
+// Texture's rows committed and the reader's place restored, then the
+// captured geometry replayed, with the rail and reopen arrow moving beside it.
+static void ApolloDuoFeedRailApplyCollapse(ApolloDuoSplitHost *host, BOOL collapsed, BOOL animated) {
+    UIView *surface = host.view;
+    UINavigationController *feed = host.postsNavigation;
+    // Mid push, Back or column move, the state changes and the transition in
+    // flight lays it out when it ends.
+    BOOL busy = feed.transitionCoordinator || host.feedRailTransitioning || host.columnsSliding || host.columnScrub;
+    BOOL animate = animated && !busy && surface.window && feed.viewIfLoaded.window
+        && !UIAccessibilityIsReduceMotionEnabled();
+    if (busy) {
+        host.feedRailCollapsed = collapsed;
+        [surface setNeedsLayout];
+        return;
+    }
+    [surface layoutIfNeeded];
+    NSArray<ApolloDuoPostsGeometry *> *geometry = animate
+        ? ApolloDuoPostsCaptureGeometryWithLayers(feed.view, surface, YES) : nil;
+    NSMapTable<CALayer *, id> *text = animate ? ApolloDuoCaptureTextDrawings(@[feed.view]) : nil;
+    ApolloDuoFeedAnchor *anchor = ApolloDuoCaptureFeedAnchor(ApolloDuoSplitFindTable(feed.topViewController.viewIfLoaded));
+    BOOL railWasShown = host.feedRail.alpha > 0.5;
+    BOOL backdropWasHidden = host.trailingBackdrop.hidden;
+    BOOL reopenWasShown = host.feedRailReopen.alpha > 0.5;
+    ApolloDuoPostsStopGeometry(feed.viewIfLoaded);
+    host.feedRailCollapsed = collapsed;
+    [UIView performWithoutAnimation:^{
+        [surface setNeedsLayout];
+        [surface layoutIfNeeded];
+        [feed.view layoutIfNeeded];
+        ApolloNativeFeedSearchFinishColumnMove(feed.topViewController);
+        UITableView *table = ApolloDuoSplitFindTable(feed.topViewController.viewIfLoaded);
+        ApolloDuoMediaPrepareTableForTransition(table);
+        SEL commit = NSSelectorFromString(@"waitUntilAllUpdatesAreCommitted");
+        if ([table respondsToSelector:commit]) ((void (*)(id, SEL))objc_msgSend)(table, commit);
+        [table layoutIfNeeded];
+        if (anchor) {
+            ApolloDuoRestoreFeedAnchor(table, anchor);
+            [table layoutIfNeeded];
+        }
+        UINavigationBar *bar = feed.navigationBar;
+        [bar layoutIfNeeded];
+        ApolloNavigationTitlePresentationSettle(bar);
+        [bar layoutIfNeeded];
+        [surface layoutIfNeeded];
+    }];
+    if (!animate) return;
+    ApolloDuoFeedRailAnimateChange(host, railWasShown, backdropWasHidden, reopenWasShown, 0.32);
+    __block NSArray<ApolloDuoTextFade *> *fades = nil;
+    [CATransaction begin];
+    [CATransaction setCompletionBlock:^{ ApolloDuoEndTextCrossfade(fades, NO); }];
+    ApolloDuoGeometryTiming timing = {0.32, NO, 0};
+    NSMutableArray<ApolloDuoTextFade *> *pins = [NSMutableArray array];
+    ApolloDuoAnimateGeometry(geometry, feed.view, surface, timing, YES, NO, surface, pins);
+    ApolloDuoFadeInNewBarItems(feed.navigationBar, geometry, timing);
+    [pins addObjectsFromArray:ApolloDuoCrossfadeTextLayout(@[feed.view], text, timing)];
+    fades = pins;
+    [CATransaction commit];
+}
+
 static void ApolloDuoPostsSetDetailPages(ApolloDuoSplitState *state, NSArray<UIViewController *> *pages, BOOL animated) {
     ApolloDuoColumnScrubFinishNow(state.host);
     if (pages.count) ApolloDuoPostsReviewClosedThread(state, ApolloDuoClosedThreadEventThreadOpened, 0.0);
@@ -3945,6 +4021,7 @@ static void ApolloDuoPostsSetDetailPages(ApolloDuoSplitState *state, NSArray<UIV
     }
     // The divider stays hidden until the columns arrive.
     BOOL railWasShown = state.host.feedRail.alpha > 0.5;
+    BOOL reopenWasShown = state.host.feedRailReopen.alpha > 0.5;
     BOOL backdropWasHidden = state.host.trailingBackdrop.hidden;
     __weak ApolloDuoSplitHost *weakHost = state.host;
     NSUInteger slide = ++state.host.columnSlideGeneration;
@@ -3952,7 +4029,7 @@ static void ApolloDuoPostsSetDetailPages(ApolloDuoSplitState *state, NSArray<UIV
     // Containment runs with UIKit animation off, or UIKit's column wrappers move
     // the feed a second time; only the captured geometry animates.
     ApolloDuoPostsApplyDetailStack(state, stack, closedPages, pane, feedAnchor);
-    ApolloDuoFeedRailAnimateChange(state.host, railWasShown, backdropWasHidden, 0.32);
+    ApolloDuoFeedRailAnimateChange(state.host, railWasShown, backdropWasHidden, reopenWasShown, 0.32);
     __block NSArray<ApolloDuoTextFade *> *textFades = nil;
     [CATransaction begin];
     [CATransaction setCompletionBlock:^{
@@ -4055,8 +4132,20 @@ BOOL ApolloDuoSplitIsColumnDragging(void) {
 static NSString *const kApolloDuoRailScrubFade = @"ApolloDuoRailScrubFade";
 static NSString *const kApolloDuoRailScrubSlide = @"ApolloDuoRailScrubSlide";
 static NSArray<CALayer *> *ApolloDuoFeedRailScrubChange(ApolloDuoSplitHost *host, BOOL railWasShown,
-                                                        BOOL backdropWasHidden, ApolloDuoGeometryTiming timing) {
+                                                        BOOL backdropWasHidden, BOOL reopenWasShown,
+                                                        ApolloDuoGeometryTiming timing) {
     NSMutableArray<CALayer *> *layers = [NSMutableArray array];
+    // Collapsed, the reopen arrow fades with the finger in the rail's place.
+    UIView *reopen = host.feedRailReopen;
+    BOOL reopenShown = reopen.alpha > 0.5;
+    if (reopen && reopenShown != reopenWasShown) {
+        CABasicAnimation *fade = [CABasicAnimation animationWithKeyPath:@"opacity"];
+        fade.fromValue = @(reopenWasShown ? 1.0 : 0.0);
+        fade.toValue = @(reopenShown ? 1.0 : 0.0);
+        ApolloDuoGeometryTime(fade, timing);
+        [reopen.layer addAnimation:fade forKey:kApolloDuoRailScrubFade];
+        [layers addObject:reopen.layer];
+    }
     BOOL shown = host.feedRail.alpha > 0.5;
     if (host.feedRail && shown != railWasShown) {
         // setFeedRailShown: hides the rail half its width to the left.
@@ -4295,6 +4384,7 @@ static ApolloDuoColumnScrub *ApolloDuoColumnScrubBegin(ApolloDuoSplitState *stat
     ApolloDuoFeedAnchor *anchor = ApolloDuoCaptureFeedAnchor(
         ApolloDuoSplitFindTable(state.feed.topViewController.viewIfLoaded));
     BOOL railWasShown = host.feedRail.alpha > 0.5;
+    BOOL reopenWasShown = host.feedRailReopen.alpha > 0.5;
     BOOL backdropWasHidden = host.trailingBackdrop.hidden;
     if (opening) {
         ApolloDuoPostsApplyDetailStack(state, [@[backstop] arrayByAddingObjectsFromArray:pages], nil, CGRectNull, anchor);
@@ -4306,7 +4396,7 @@ static ApolloDuoColumnScrub *ApolloDuoColumnScrubBegin(ApolloDuoSplitState *stat
     if (travel < 1) {
         // Nothing to slide across; the columns stay as the drag left them.
         if (!opening) ApolloDuoUnparkThread(state, YES, pages, pane);
-        ApolloDuoFeedRailAnimateChange(host, railWasShown, backdropWasHidden, 0.32);
+        ApolloDuoFeedRailAnimateChange(host, railWasShown, backdropWasHidden, reopenWasShown, 0.32);
         ApolloDuoSplitScheduleUpdate();
         return nil;
     }
@@ -4344,7 +4434,7 @@ static ApolloDuoColumnScrub *ApolloDuoColumnScrubBegin(ApolloDuoSplitState *stat
     ApolloDuoFadeInNewBarItems(state.feed.navigationBar, geometry, timing);
     [pins addObjectsFromArray:ApolloDuoCrossfadeTextLayout(@[feedView], text, timing)];
     scrub.textFades = pins;
-    scrub.railLayers = ApolloDuoFeedRailScrubChange(host, railWasShown, backdropWasHidden, timing);
+    scrub.railLayers = ApolloDuoFeedRailScrubChange(host, railWasShown, backdropWasHidden, reopenWasShown, timing);
     __weak ApolloDuoColumnScrub *weakScrub = scrub;
     __weak ApolloDuoSplitHost *weakHost = host;
     ApolloDuoScheduleRetarget(feedView, ^BOOL {

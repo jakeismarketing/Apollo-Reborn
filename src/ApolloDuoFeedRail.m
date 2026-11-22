@@ -296,9 +296,13 @@ static UIImage *ApolloDuoFeedRailGlyph(UIImage *source) {
     self.glass.frame = circle;
     self.chevron.frame = circle;
 }
+// The press dims the circle, not the control: the host shows and hides the
+// reopen arrow through the control's own alpha, which a late unhighlight
+// would otherwise undo.
 - (void)setHighlighted:(BOOL)highlighted {
     [super setHighlighted:highlighted];
-    self.alpha = highlighted ? 0.55 : 1;
+    self.glass.alpha = highlighted ? 0.55 : 1;
+    self.chevron.alpha = highlighted ? 0.55 : 1;
 }
 - (void)refreshColors {
     self.chevron.tintColor = ApolloNavigationChromeColor() ?: UIColor.labelColor;
